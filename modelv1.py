@@ -13,6 +13,7 @@ from transformers import (
 from transformers.trainer_utils import EvalPrediction
 from datasets import load_dataset
 import evaluate
+from pathlib import Path
 
 def main():
     # Argument parser
@@ -48,7 +49,14 @@ def main():
     if args.mode == "train":
         # Training mode
         # Step 1: Load the SQuAD v1.1 dataset
-        dataset = load_dataset('squad')
+
+        # Modified to load provided dataset:
+
+        # dataset = load_dataset('squad')
+
+        current_directory = Path(__file__).parent
+        processed_squad_data_path = current_directory / "processed_squad_data.json"
+        dataset = load_dataset('json', data_files=str(processed_squad_data_path), field='data')
 
         # Step 2: Preprocess the data
         def preprocess_function(examples):
@@ -120,9 +128,15 @@ def main():
 
             inputs["example_id"] = [examples["id"][sample_mapping[i]] for i in range(len(sample_mapping))]
             return inputs
+        
+        # Modified to work with provided dataset: 
+
+        # tokenized_datasets = dataset.map(
+        #     preprocess_function, batched=True, remove_columns=dataset["train"].column_names
+        # )
 
         tokenized_datasets = dataset.map(
-            preprocess_function, batched=True, remove_columns=dataset["train"].column_names
+            preprocess_function, batched=True
         )
 
         # Step 3: Define the Retro-Reader model with Sketchy and Intensive Readers
