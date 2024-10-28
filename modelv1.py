@@ -9,7 +9,6 @@ from tqdm import tqdm
 import json
 import os
 
-# Define the components of RetroReader
 class SketchyReader(nn.Module):
     def __init__(self):
         super(SketchyReader, self).__init__()
@@ -68,11 +67,11 @@ class RetroReaderModel(nn.Module):
             "end_logits": end_logits,
             "verifier_logits": verifier_logits,
         }
-# Load SQuAD v1.1 dataset
+
+
 dataset = load_dataset("squad")
 tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
-# Preprocess dataset
 def preprocess_function(examples):
     tokenized_examples = tokenizer(
         examples["question"],
@@ -114,16 +113,13 @@ def preprocess_function(examples):
 tokenized_datasets = dataset.map(preprocess_function, batched=True)
 tokenized_datasets.set_format(type="torch", columns=["input_ids", "attention_mask", "start_positions", "end_positions", "id"])
 
-# Create DataLoaders
 train_loader = DataLoader(tokenized_datasets["train"].select(range(5000)), batch_size=8, shuffle=True)
 val_loader = DataLoader(tokenized_datasets["validation"], batch_size=8)
 
-# Initialize Model and Optimizer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = RetroReaderModel().to(device)
 optimizer = optim.Adam(model.parameters(), lr=3e-5)
 
-# Training function with tqdm for progress tracking
 def train_epoch(model, dataloader, optimizer):
     model.train()
     total_loss = 0
@@ -146,20 +142,17 @@ def train_epoch(model, dataloader, optimizer):
 
     return total_loss / len(dataloader)
 
-# Main training loop with tqdm for epoch progress tracking
 def train_model(model, train_loader, val_loader, epochs=10):
     for epoch in range(epochs):
         train_loss = train_epoch(model, train_loader, optimizer)
         print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}")
 
-# Save model and tokenizer
 def save_model(model, tokenizer, model_path="retro_reader_model.pth", tokenizer_path="tokenizer/"):
     torch.save(model.state_dict(), model_path)
     tokenizer.save_pretrained(tokenizer_path)
     print(f"Model saved to {model_path}")
     print(f"Tokenizer saved to {tokenizer_path}")
 
-# Load model and tokenizer
 def load_model(model_path="retro_reader_model.pth", tokenizer_path="tokenizer/"):
     model = RetroReaderModel()
     model.load_state_dict(torch.load(model_path, map_location=device))
@@ -168,7 +161,6 @@ def load_model(model_path="retro_reader_model.pth", tokenizer_path="tokenizer/")
     print("Model and tokenizer loaded successfully.")
     return model, tokenizer
 
-# Generate predictions on the validation set and output to JSON file
 def generate_predictions(model, dataloader, tokenizer, output_file="predictions.json"):
     model.eval()
     predictions = {}
@@ -193,15 +185,11 @@ def generate_predictions(model, dataloader, tokenizer, output_file="predictions.
         json.dump(predictions, f)
     print(f"Predictions saved to {output_file}")
 
-# Example usage
 if __name__ == "__main__":
-    # Train the model
     train_model(model, train_loader, val_loader, epochs=10)
 
-    # Save the trained model and tokenizer
     save_model(model, tokenizer)
 
-    # Load the model and tokenizer for prediction
     model, tokenizer = load_model()
-    # Generate predictions on validation set and save to JSON
+    
     generate_predictions(model, val_loader, tokenizer)
