@@ -54,11 +54,26 @@ class RetroReaderModel(nn.Module):
         self.intensive_reader = IntensiveReader()
         self.answer_verifier = AnswerVerifier()
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, relevance_threshold=0.5):
+        # Step 1: Sketchy Reader - Identify relevance
         relevance_logits = self.sketchy_reader(input_ids=input_ids, attention_mask=attention_mask)
-        
-        start_logits, end_logits = self.intensive_reader(input_ids=input_ids, attention_mask=attention_mask)
-        
+        relevance_scores = torch.sigmoid(relevance_logits).squeeze(-1)
+
+        # Mask out examples with low relevance
+        relevant_mask = relevance_scores >= relevance_threshold
+
+        # Step 2: Intensive Reader - Generate start and end logits for relevant contexts only
+        if relevant_mask.any():
+            relevant_input_ids = input_ids[relevant_mask]
+            relevant_attention_mask = attention_mask[relevant_mask]
+            start_logits, end_logits = self.intensive_reader(
+                input_ids=relevant_input_ids,
+                attention_mask=relevant_attention_mask
+            )
+        else:
+            start_logits, end_logits = None, None  # No relevant context
+
+        # Step 3: Answer Verifier - Validate the generated answer span
         verifier_logits = self.answer_verifier(input_ids=input_ids, attention_mask=attention_mask)
 
         return {
@@ -66,7 +81,9 @@ class RetroReaderModel(nn.Module):
             "start_logits": start_logits,
             "end_logits": end_logits,
             "verifier_logits": verifier_logits,
+            "relevant_mask": relevant_mask
         }
+
 
 
 dataset = load_dataset("squad")
@@ -120,7 +137,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = RetroReaderModel().to(device)
 optimizer = optim.Adam(model.parameters(), lr=3e-5)
 
-def train_epoch(model, dataloader, optimizer):
+def train_epoch(model, dataloader, optimizer, relevance_threshold=0.5):
     model.train()
     total_loss = 0
     for batch in tqdm(dataloader, desc="Training"):
@@ -130,17 +147,27 @@ def train_epoch(model, dataloader, optimizer):
         end_positions = batch['end_positions'].to(device)
 
         optimizer.zero_grad()
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, relevance_threshold=relevance_threshold)
 
-        start_loss = F.cross_entropy(outputs["start_logits"], start_positions)
-        end_loss = F.cross_entropy(outputs["end_logits"], end_positions)
+        relevant_mask = outputs["relevant_mask"]
+        
+        if relevant_mask.any():
+            relevant_start_logits = outputs["start_logits"]
+            relevant_end_logits = outputs["end_logits"]
+            relevant_start_positions = start_positions[relevant_mask]
+            relevant_end_positions = end_positions[relevant_mask]
+            start_loss = F.cross_entropy(relevant_start_logits, relevant_start_positions)
+            end_loss = F.cross_entropy(relevant_end_logits, relevant_end_positions)
+            loss = start_loss + end_loss
 
-        loss = start_loss + end_loss
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        else:
+            continue
 
     return total_loss / len(dataloader)
+
 
 def train_model(model, train_loader, val_loader, epochs=10):
     for epoch in range(epochs):
