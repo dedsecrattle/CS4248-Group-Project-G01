@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, AutoModel, AdamW, get_linear_schedule_with_warmup, DataCollatorWithPadding
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup, DataCollatorWithPadding
 from datasets import load_dataset, Dataset
 import numpy as np
 from tqdm import tqdm
@@ -139,21 +140,29 @@ class CustomDataCollator:
         
         return batch
 
-def train_model_and_save(model, train_dataset, epochs=3, batch_size=8, lr=3e-5, save_path="retro_reader_model.pth"):
+def train_model_and_save(model, train_dataset, val_dataset, epochs=3, batch_size=8, lr=3e-5, save_path="retro_reader_model.pth"):
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=data_collator)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=data_collator)
+    
     optimizer = AdamW(model.parameters(), lr=lr)
     num_training_steps = epochs * len(train_loader)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=num_training_steps)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    model.train()
+    
+    train_losses = []
+    val_losses = []
 
     for epoch in range(epochs):
-        total_loss = 0
-        for batch in tqdm(train_loader, desc=f"Training Epoch {epoch + 1}/{epochs}"):
+        model.train()
+        total_train_loss = 0
+        train_bar = tqdm(train_loader, desc=f"Training Epoch {epoch + 1}/{epochs}")
+        
+        for batch in train_bar:
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             start_positions = batch["start_positions"].to(device)
@@ -166,17 +175,49 @@ def train_model_and_save(model, train_dataset, epochs=3, batch_size=8, lr=3e-5, 
             start_loss = nn.CrossEntropyLoss()(start_logits, start_positions)
             end_loss = nn.CrossEntropyLoss()(end_logits, end_positions)
             loss = start_loss + end_loss
-            total_loss += loss.item()
+            total_train_loss += loss.item()
             
             loss.backward()
             optimizer.step()
             scheduler.step()
+            
+            train_bar.set_postfix({'train_loss': f'{loss.item():.4f}'})
         
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch + 1}/{epochs} completed with average loss {avg_loss:.4f}")
-    
+        avg_train_loss = total_train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+
+        model.eval()
+        total_val_loss = 0
+        val_bar = tqdm(val_loader, desc=f"Validation Epoch {epoch + 1}/{epochs}")
+        
+        with torch.no_grad():
+            for batch in val_bar:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                start_positions = batch["start_positions"].to(device)
+                end_positions = batch["end_positions"].to(device)
+                question_mask = (input_ids == tokenizer.sep_token_id).cumsum(dim=1).to(device) == 1
+
+                final_decision, start_logits, end_logits, _, _ = model(input_ids, attention_mask, question_mask)
+
+                start_loss = nn.CrossEntropyLoss()(start_logits, start_positions)
+                end_loss = nn.CrossEntropyLoss()(end_logits, end_positions)
+                val_loss = start_loss + end_loss
+                total_val_loss += val_loss.item()
+                
+                val_bar.set_postfix({'val_loss': f'{val_loss.item():.4f}'})
+
+        avg_val_loss = total_val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+        
+        print(f"\nEpoch {epoch + 1}/{epochs}")
+        print(f"Average Training Loss: {avg_train_loss:.4f}")
+        print(f"Average Validation Loss: {avg_val_loss:.4f}")
+
     torch.save(model.state_dict(), save_path)
     print(f"Model saved to {save_path}")
+
+
 def load_model_and_predict(model, val_dataset, model_path="retro_reader_model.pth", output_file="predictions.json", batch_size=8):
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     data_collator = CustomDataCollator(tokenizer)
@@ -220,6 +261,7 @@ def main(train=True):
     dataset = load_dataset("squad")
     tokenized_dataset = prepare_training_data()
     train_dataset = tokenized_dataset["train"]
+    validation_dataset = tokenized_dataset["validation"]
     val_dataset = prepare_prediction_data(dataset["validation"])
     
     model = RetroReader()
@@ -229,6 +271,7 @@ def main(train=True):
         train_model_and_save(
             model=model,
             train_dataset=train_dataset,
+            val_dataset=validation_dataset,
             epochs=3,
             batch_size=8,
             lr=3e-5,
@@ -245,4 +288,4 @@ def main(train=True):
         )
 
 if __name__ == "__main__":
-    main(train=False)  # Set to `False` to only test and generate predictions
+    main(train=True)  # Set to `False` to only test and generate predictions
