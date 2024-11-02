@@ -4,9 +4,8 @@ This project aims to develop an efficient Extractive QA system using the Retrosp
 
 ## Training the Model
 
-To train the model and generate predicition on Validation Set, use the following command:
+To train the model and generate predicition on Validation Set, use the following command and set `train = True` in the `main()` function
 
 ```bash
-python modelv1.py
+python retro-reader.py
 ```
-
