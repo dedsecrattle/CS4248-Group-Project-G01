@@ -13,137 +13,179 @@ from datasets import load_dataset
 from tqdm import tqdm
 import json
 
-
 class RetroReader(nn.Module):
+    
     def __init__(
         self,
-        model_name="bert-base-uncased",
-        weight_sketchy=0.5,
-        weight_intensive=0.5,
-        is_squad_v2=False,
+        model_name="bert-base-uncased",  # Default BERT model
+        weight_sketchy=0.5,              # Weight for the unanswerable (sketchy) score
+        weight_intensive=0.5,            # Weight for the answerable (intensive) score
+        is_squad_v2=False,               # Flag indicating whether SQuAD v2 dataset is used
     ):
         super(RetroReader, self).__init__()
+        
+        # Initialize the BERT encoder model
         self.encoder = AutoModel.from_pretrained(model_name)
         self.is_squad_v2 = is_squad_v2
+        
+        # Additional output layer to predict answerability (used for SQuAD v2)
         if self.is_squad_v2:
             self.answerable_head = nn.Linear(
-                self.encoder.config.hidden_size, 2
+                self.encoder.config.hidden_size, 2  # Predicts two values: answerable and unanswerable
             )
+        
+        # Cross-attention layer to refine answers based on question-context attention
         self.cross_attention = nn.MultiheadAttention(
             self.encoder.config.hidden_size, num_heads=8
         )
+        
+        # Linear layers for predicting start and end positions of the answer span
         self.start_head = nn.Linear(self.encoder.config.hidden_size, 1)
         self.end_head = nn.Linear(self.encoder.config.hidden_size, 1)
+        
+        # Linear layer for verifying the overall answer confidence
         self.verifier_head = nn.Linear(self.encoder.config.hidden_size, 1)
+        
+        # Weights to balance answerable and unanswerable scores
         self.weight_sketchy = weight_sketchy
         self.weight_intensive = weight_intensive
 
     def forward(self, input_ids, attention_mask, question_mask):
+        # Pass input through the encoder to get token representations
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        sequence_output = outputs.last_hidden_state
+        sequence_output = outputs.last_hidden_state  # Token embeddings from the encoder
+        
+        # Extract the CLS token embedding, often used for classification tasks
         cls_token = sequence_output[:, 0, :]
-
+        
+        # Compute score for "null" answer (unanswerable case) if is_squad_v2 is True
         if self.is_squad_v2:
             answer_logits = self.answerable_head(cls_token)
-            score_null = answer_logits[:, 1] - answer_logits[:, 0]
+            score_null = answer_logits[:, 1] - answer_logits[:, 0]  # Score for unanswerability
         else:
             score_null = 0
 
+        # Use question_mask to zero out non-question tokens
         question_tokens = sequence_output * question_mask.unsqueeze(-1)
+        
+        # Apply cross-attention: focuses on question-relevant parts of the context
         question_attended, _ = self.cross_attention(
-            question_tokens.permute(1, 0, 2),
-            sequence_output.permute(1, 0, 2),
-            sequence_output.permute(1, 0, 2),
+            question_tokens.permute(1, 0, 2),  # Query: question tokens
+            sequence_output.permute(1, 0, 2),  # Key: full context
+            sequence_output.permute(1, 0, 2),  # Value: full context
         )
         question_attended = question_attended.permute(1, 0, 2)
 
+        # Predict start and end logits for answer span
         start_logits = self.start_head(question_attended).squeeze(-1)
         end_logits = self.end_head(question_attended).squeeze(-1)
 
+        # Calculate verifier score to confirm the quality of the answer
         verifier_score = self.verifier_head(cls_token)
 
+        # Compute "has-answer" score by finding the maximum logit values for start and end positions
         score_has = start_logits.max(dim=1).values + end_logits.max(dim=1).values
+
+        # Combine scores to get the final confidence score
         final_score = (
-            self.weight_sketchy * score_null
-            + self.weight_intensive * score_has
-            + verifier_score.squeeze(-1)
+            self.weight_sketchy * score_null          # Weighted null answer score
+            + self.weight_intensive * score_has       # Weighted answer score
+            + verifier_score.squeeze(-1)              # Verifier score
         )
 
+        # For SQuAD v2, final decision is based on whether final_score is positive
         if self.is_squad_v2:
             final_decision = final_score > 0
             return final_decision, start_logits, end_logits, answer_logits, verifier_score
         else:
+            # For datasets without unanswerable questions, assume always answerable
             final_decision = torch.ones_like(final_score, dtype=torch.bool)
             return final_decision, start_logits, end_logits, verifier_score
 
 
 def prepare_training_data_squad_v1(tokenizer, max_length=384):
+    # os.environ["TOKENIZERS_PARALLELISM"] = "false"  # (Optional) Turn off parallelism for tokenizers to prevent warnings
+
+    # Load the SQuAD v1 dataset using the Hugging Face `datasets` library
     dataset = load_dataset("squad")
 
     def preprocess(examples):
+        # Tokenize the questions and contexts with truncation, padding, and offset mappings
         inputs = tokenizer(
-            examples["question"],
-            examples["context"],
-            max_length=max_length,
-            truncation="only_second",
-            return_overflowing_tokens=True,
-            return_offsets_mapping=True,
-            padding="max_length",
+            examples["question"],                # List of questions
+            examples["context"],                 # List of contexts corresponding to questions
+            max_length=max_length,               # Max token length for each sequence
+            truncation="only_second",            # Truncate context if it exceeds max_length
+            return_overflowing_tokens=True,      # Return extra tokens if context overflows max_length
+            return_offsets_mapping=True,         # Return token-character position mappings
+            padding="max_length"                 # Pad each input to max_length
         )
 
+        # `offset_mapping` provides start and end character indices of each token in the original text
         offset_mapping = inputs.pop("offset_mapping")
+        
+        # `overflow_to_sample_mapping` maps each tokenized chunk to the corresponding example in the original dataset
         sample_mapping = inputs.pop("overflow_to_sample_mapping")
+
+        # Initialize lists to store start and end positions of answer spans in tokens
         start_positions = []
         end_positions = []
 
+        # Loop through each tokenized example
         for i, offsets in enumerate(offset_mapping):
-            input_ids = inputs["input_ids"][i]
-            cls_index = input_ids.index(tokenizer.cls_token_id)
-            sample_index = sample_mapping[i]
-            answers = examples["answers"][sample_index]
+            input_ids = inputs["input_ids"][i]      # Get token IDs for this example
+            cls_index = input_ids.index(tokenizer.cls_token_id)  # Index of [CLS] token in input IDs
+            sample_index = sample_mapping[i]        # Original example index from dataset
+            answers = examples["answers"][sample_index]  # Get answer annotations for this example
 
+            # If there are no answers (shouldn't occur in SQuAD v1):
             if len(answers["answer_start"]) == 0:
-                # Should not happen in SQuAD v1.1
-                start_positions.append(cls_index)
+                start_positions.append(cls_index)   # Default to [CLS] if no answer
                 end_positions.append(cls_index)
             else:
+                # Get the character start and end of the answer in the original text
                 start_char = answers["answer_start"][0]
                 end_char = start_char + len(answers["text"][0])
 
-                # Find the start and end token indices
+                # Identify the token index for the start of the answer
                 token_start_index = 0
                 while (
-                    token_start_index < len(offsets)
-                    and offsets[token_start_index][0] <= start_char
+                    token_start_index < len(offsets) and offsets[token_start_index][0] <= start_char
                 ):
                     token_start_index += 1
-                token_start_index -= 1
+                token_start_index -= 1  # Adjust to the actual starting token
 
+                # Identify the token index for the end of the answer
                 token_end_index = len(offsets) - 1
                 while token_end_index >= 0 and offsets[token_end_index][1] >= end_char:
                     token_end_index -= 1
-                token_end_index += 1
+                token_end_index += 1  # Adjust to the actual ending token
 
-                # Sometimes the answer cannot be found in the text
+                # Handle cases where the tokenized answer span doesn't match the original answer span
                 if (
-                    offsets[token_start_index][0] > start_char
-                    or offsets[token_end_index][1] < end_char
+                    offsets[token_start_index][0] > start_char or offsets[token_end_index][1] < end_char
                 ):
+                    # Use [CLS] token if answer span is not found in tokenized text
                     start_positions.append(cls_index)
                     end_positions.append(cls_index)
                 else:
+                    # Add valid token indices for the start and end of the answer span
                     start_positions.append(token_start_index)
                     end_positions.append(token_end_index)
 
+        # Add start and end positions to the tokenized inputs
         inputs["start_positions"] = start_positions
         inputs["end_positions"] = end_positions
         return inputs
 
+    # Apply `preprocess` function to each example in the dataset in batches
     tokenized_dataset = dataset.map(
-        preprocess, batched=True, remove_columns=dataset["train"].column_names
+        preprocess, 
+        batched=True,                             # Process examples in batches for efficiency
+        remove_columns=dataset["train"].column_names  # Remove original columns for cleaner dataset
     )
 
-    return tokenized_dataset
+    return tokenized_dataset  # Return the tokenized dataset with added answer span labels
 
 
 def prepare_training_data_squad_v2(tokenizer, max_length=384):
@@ -171,9 +213,8 @@ def prepare_training_data_squad_v2(tokenizer, max_length=384):
             cls_index = input_ids.index(tokenizer.cls_token_id)
             sample_index = sample_mapping[i]
             answers = examples["answers"][sample_index]
-            is_impossible = examples["is_impossible"][sample_index]
 
-            if is_impossible or len(answers["answer_start"]) == 0:
+            if len(answers["text"]) == 0 or len(answers["answer_start"]) == 0:
                 start_positions.append(cls_index)
                 end_positions.append(cls_index)
                 answerable_labels.append(0)
@@ -181,30 +222,31 @@ def prepare_training_data_squad_v2(tokenizer, max_length=384):
                 start_char = answers["answer_start"][0]
                 end_char = start_char + len(answers["text"][0])
 
-                token_start_index = 0
-                while (
-                    token_start_index < len(offsets)
-                    and offsets[token_start_index][0] <= start_char
-                ):
-                    token_start_index += 1
-                token_start_index -= 1
+                sequence_ids = inputs.sequence_ids(i)
 
-                token_end_index = len(offsets) - 1
-                while (
-                    token_end_index >= 0 and offsets[token_end_index][1] >= end_char
-                ):
-                    token_end_index -= 1
-                token_end_index += 1
-                if (
-                    offsets[token_start_index][0] > start_char
-                    or offsets[token_end_index][1] < end_char
-                ):
+                idx = 0
+                while sequence_ids[idx] != 1:
+                    idx += 1
+                context_start = idx
+                while sequence_ids[idx] == 1:
+                    idx += 1
+                context_end = idx - 1
+
+                if offsets[context_start][0] > start_char or offsets[context_end][1] < end_char:
                     start_positions.append(cls_index)
                     end_positions.append(cls_index)
                     answerable_labels.append(0)
                 else:
-                    start_positions.append(token_start_index)
-                    end_positions.append(token_end_index)
+                    start_idx = context_start
+                    while start_idx <= context_end and offsets[start_idx][0] <= start_char:
+                        start_idx += 1
+                    start_positions.append(start_idx - 1)
+
+                    end_idx = context_end
+                    while end_idx >= context_start and offsets[end_idx][1] >= end_char:
+                        end_idx -= 1
+                    end_positions.append(end_idx + 1)
+
                     answerable_labels.append(1)
 
         inputs["start_positions"] = start_positions
@@ -220,44 +262,68 @@ def prepare_training_data_squad_v2(tokenizer, max_length=384):
 
 
 def prepare_prediction_data(dataset, tokenizer, max_length=384):
+    # Preprocess function to tokenize inputs for prediction
     def preprocess(examples):
+        # Tokenize the "question" and "context" columns in the dataset
         tokenized_inputs = tokenizer(
-            examples["question"],
-            examples["context"],
-            max_length=max_length,
-            truncation="only_second",
-            return_overflowing_tokens=True,
-            return_offsets_mapping=True,
-            padding="max_length",
+            examples["question"],  # Input question
+            examples["context"],   # Input context (passage of text)
+            max_length=max_length, # Maximum length of tokenized input
+            truncation="only_second", # Truncate the context if input exceeds max_length
+            return_overflowing_tokens=True, # Handle cases where the tokenized input exceeds max_length
+            return_offsets_mapping=True,  # Return token offsets for alignment with original text
+            padding="max_length", # Pad all sequences to the same length
         )
 
+        # Get the mapping from overflowing tokens back to their original sample
         sample_mapping = tokenized_inputs.pop("overflow_to_sample_mapping")
 
+        # Create a list of original example IDs based on the mapping from overflowed tokens
         original_ids = [
-            str(examples["id"][sample_mapping[i]])
-            for i in range(len(tokenized_inputs["input_ids"]))
+            str(examples["id"][sample_mapping[i]])  # Get the original ID of each example
+            for i in range(len(tokenized_inputs["input_ids"]))  # Iterate over all tokenized inputs
         ]
 
+        # Add the original IDs to the tokenized inputs as a new column
         tokenized_inputs["original_id"] = original_ids
 
+        # Return the processed tokenized inputs with the new "original_id" column
         return tokenized_inputs
 
+    # Apply the preprocess function to the dataset
     tokenized_dataset = dataset.map(
-        preprocess, batched=True, remove_columns=dataset.column_names
+        preprocess,               # Apply the `preprocess` function to the dataset
+        batched=True,             # Process examples in batches for efficiency
+        remove_columns=dataset.column_names  # Remove the original columns to keep only the tokenized ones
     )
 
+    # Return the tokenized dataset
     return tokenized_dataset
 
 
+
 class CustomDataCollator:
+
+    # Its job is to take individual text examples, pad them to the same length (so they can be processed together in a batch)
+    # Make sure certain important information (like the original_id of each example) is kept intact during the padding and batching process.
+
     def __init__(self, tokenizer):
         self.data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
     def __call__(self, features):
+        # This method is called when we use the collator in a DataLoader.
+        # It takes a list of tokenized features (inputs) and processes them.
+
+        # Extracts the original_ids before passing the features to the data collator.
+        # The original_id is stored separately to ensure it is retained in the final batch.
         original_ids = [feature.pop("original_id") for feature in features]
 
+        # Use the default data collator (DataCollatorWithPadding) to process the features.
+        # This will pad the sequences, create attention masks, and return the batched data.
         batch = self.data_collator(features)
 
+        # After collating the features, add the original_ids back to the batch.
+        # This ensures that the original_id is preserved in the final batch.
         batch["original_id"] = original_ids
 
         return batch
